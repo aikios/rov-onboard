@@ -2,94 +2,123 @@
 
 Onboard computer nodes for the underwater ROV. Runs on the Raspberry Pi 5 (Ubuntu 24.04, ROS2 Jazzy).
 
-## Architecture
-
-`joy_to_mavlink` owns the FC serial port (`/dev/ttyACM0`) and forwards telemetry to MAVROS via UDP. This bypasses a MAVROS 2.14.0 limitation where ManualControl messages published on ROS topics are not forwarded to the FC.
-
-```
-joy_to_mavlink ──MANUAL_CONTROL──► /dev/ttyACM0 (FC)
-      │
-      └──raw telemetry──► UDP:14550 → MAVROS → ROS topics
-```
-
-## Nodes
-
-| Node | Description |
-|------|-------------|
-| `joy_to_mavlink` | Owns FC serial. Receives `/joy` from topside, sends MANUAL_CONTROL to FC. Arms/disarms directly. Forwards FC telemetry to MAVROS. Implements depth hold PID. Sends GCS heartbeat to prevent FC auto-disarm. |
-| `photogrammetry_node` | Service `/photogrammetry/capture` — HTTP-triggers Pi Zero camera, publishes full-res JPEG on `/photogrammetry/image`. |
-
 ## Prerequisites
 
 ```bash
-sudo apt install ros-jazzy-desktop ros-jazzy-rmw-cyclonedds-cpp \
-    ros-jazzy-usb-cam ros-jazzy-image-transport \
-    ros-jazzy-compressed-image-transport ros-jazzy-image-transport-plugins \
-    ros-jazzy-std-srvs ros-jazzy-mavros ros-jazzy-mavros-extras
-sudo pip3 install --break-system-packages pymavlink
+# ROS2 Jazzy (should already be installed)
+sudo apt install ros-jazzy-desktop
+
+# Required ROS2 packages
+sudo apt install \
+    ros-jazzy-rmw-cyclonedds-cpp \
+    ros-jazzy-usb-cam \
+    ros-jazzy-image-transport \
+    ros-jazzy-compressed-image-transport \
+    ros-jazzy-image-transport-plugins \
+    ros-jazzy-std-srvs
 ```
 
-## Build
+## Setup
 
 ```bash
+# Build the workspace
 cd ~/rov_ws
 source /opt/ros/jazzy/setup.bash
 colcon build --packages-select rov_cameras --symlink-install
+
+# Or use the build script
+./src/rov_cameras/scripts/build.sh
+
+# Clean rebuild if needed
+./src/rov_cameras/scripts/build.sh --clean
 ```
 
-## Flight Controller Setup
+## DDS Configuration
 
+Cyclone DDS with unicast peer discovery (no multicast) for Docker compatibility.
+
+The config file at `~/cyclonedds.xml` must exist with correct peer IPs:
+- Onboard (Pi 5): `192.168.1.70`
+- Topside: `192.168.1.69`
+
+Two environment variables must be set in every terminal:
 ```bash
-# Flash ArduSub (from Pi 5)
-cd ~/ardupilot_fw
-python3 uploader.py ardusub_fmuv3.apj --port /dev/ttyACM0
-
-# Key parameters (set via pymavlink then save+reboot):
-#   FRAME_CONFIG = 2 (VECTORED_6DOF, 8 motors)
-#   ARMING_CHECK = 0 (disabled for bench testing)
-#   BRD_SAFETYOPTION = 0
-
-# USB power cycle (software, no unplug needed):
-sudo sh -c "echo 0 > /sys/bus/usb/devices/2-1/authorized"
-sleep 3
-sudo sh -c "echo 1 > /sys/bus/usb/devices/2-1/authorized"
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file://${HOME}/cyclonedds.xml
 ```
+
+The startup scripts handle this automatically.
 
 ## Running
 
-### Recommended: use the full launcher script from topside
+You need **two terminals** (or SSH sessions) on the Pi 5:
+
+### Terminal 1 — Cameras + Photogrammetry
 ```bash
-bash /tmp/launch_rov.sh
+./src/rov_cameras/scripts/start_onboard.sh
 ```
 
-### Manual (order matters):
+This starts:
+- `photogrammetry_node` — HTTP-triggers Pi Zero camera, publishes full-res images
+- `pilot_cam_front` — USB camera on `/dev/video0` (640x480 @ 30fps)
+- `pilot_cam_down` — USB camera on `/dev/video2` (640x480 @ 30fps)
+
+> **Note:** Pilot cameras will error if USB cameras are not physically connected. The photogrammetry node works independently.
+
+### Terminal 2 — Joystick Translation
+```bash
+./src/rov_cameras/scripts/start_joy_translator.sh
+```
+
+This starts:
+- `joy_to_mavlink` — subscribes to `/joy` from topside, translates DS4 inputs to thruster PWM values
+
+Currently in **logging mode** — prints translated values to console. MAVROS RC override output will be added once the ArduPilot flight controller is connected.
+
+## Nodes
+
+| Node | Topic/Service | Type | Direction | Description |
+|------|--------------|------|-----------|-------------|
+| `photogrammetry_node` | `/photogrammetry/capture` | `Trigger` (srv) | in | Triggers a capture on the Pi Zero |
+| `photogrammetry_node` | `/photogrammetry/image` | `CompressedImage` (pub) | out | Full-res JPEG from Pi Zero camera |
+| `pilot_cam_front` | `/camera/pilot_front/image_raw` | `Image` (pub) | out | Forward USB camera feed |
+| `pilot_cam_down` | `/camera/pilot_down/image_raw` | `Image` (pub) | out | Downward USB camera feed |
+| `joy_to_mavlink` | `/joy` | `Joy` (sub) | in | DS4 joystick input from topside |
+
+## Photogrammetry Camera (Pi Zero)
+
+The Pi Zero 2 W runs independently (not ROS). It hosts an HTTP capture server:
+- **URL:** `http://192.168.7.2:8080/capture` (over USB ethernet)
+- **Status:** `http://192.168.7.2:8080/status`
+- Captures 4608x2592 JPEG via Camera Module 3 (IMX708)
+- ~0.5 seconds per capture
+
+The `photogrammetry_node` on Pi 5 bridges this into ROS2.
+
+## ArduPilot Connection (Planned)
+
+Connect a Pixhawk-class flight controller via USB to the Pi 5:
+- Enumerates as `/dev/ttyACM0`
+- MAVROS connects at 115200 baud
+- `joy_to_mavlink` will send RC override commands via MAVROS topics
+
+## Debugging
+
 ```bash
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export CYCLONEDDS_URI=file://${HOME}/cyclonedds.xml
 source /opt/ros/jazzy/setup.bash
 source ~/rov_ws/install/setup.bash
 
-# 1. joy_to_mavlink (must start before MAVROS, owns serial)
+# Check topics from both machines
+ros2 topic list
+
+# Test photogrammetry capture manually
+ros2 service call /photogrammetry/capture std_srvs/srv/Trigger
+
+# Monitor joystick translation
 ros2 run rov_cameras joy_to_mavlink
 
-# 2. MAVROS (reads UDP:14550, publishes ROS topics)
-ros2 launch rov_cameras mavros.launch.py
-
-# 3. Photogrammetry (optional)
-ros2 run rov_cameras photogrammetry_node
+# Check Pi Zero camera directly
+curl http://192.168.7.2:8080/status
 ```
-
-## Photogrammetry Camera (Pi Zero)
-
-Not ROS — standalone HTTP server:
-- **URL:** `http://192.168.7.2:8080/capture`
-- **Status:** `http://192.168.7.2:8080/status`
-- 4608x2592 JPEG, ~0.5s per capture
-- `photogrammetry_node` bridges this into ROS2
-
-## Depth Hold
-
-- Reads depth from `/mavros/vfr_hud` (Bar30 sensor via ArduSub)
-- PID: kp=1.0, ki=0.1, kd=0.5 (tunable via ROS params)
-- Toggle via D-pad left on DS4
-- Adjusts setpoint +/-0.25m via D-pad up/down

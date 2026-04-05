@@ -211,7 +211,7 @@ class JoyToMavlink(Node):
             self.want_armed = not self.want_armed; self.arm_pending = True; self._arm(self.want_armed)
         self.arm_btn_prev = opts
 
-        tri = msg.buttons[2] == 1
+        tri = msg.buttons[1] == 1  # Circle button
         if tri and not self.cap_btn_prev: self._capture()
         self.cap_btn_prev = tri
 
