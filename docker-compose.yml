@@ -1,0 +1,23 @@
+services:
+  joy_to_mavlink:
+    build: .
+    network_mode: host
+    privileged: true  # for /dev/ttyACM0 serial access
+    volumes:
+      - /dev:/dev
+    command: ros2 run rov_cameras joy_to_mavlink
+    restart: unless-stopped
+
+  mavros:
+    build: .
+    network_mode: host
+    command: ros2 launch rov_cameras mavros.launch.py
+    depends_on:
+      - joy_to_mavlink
+    restart: unless-stopped
+
+  photogrammetry:
+    build: .
+    network_mode: host
+    command: ros2 run rov_cameras photogrammetry_node
+    restart: unless-stopped
