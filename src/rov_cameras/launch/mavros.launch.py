@@ -9,7 +9,7 @@ def generate_launch_description():
         name='mavros',
         output='screen',
         parameters=[{
-            'fcu_url': 'serial:///dev/ttyACM0:115200',
+            'fcu_url': 'udp://:14550@',
             'gcs_url': '',
             'target_system_id': 1,
             'target_component_id': 1,

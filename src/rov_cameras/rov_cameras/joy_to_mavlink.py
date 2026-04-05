@@ -1,63 +1,59 @@
 """
-Joystick to MAVLink translation node.
+Joystick to MAVLink — owns serial port, forwards to MAVROS via UDP.
 
-Runs on Pi 5 (onboard). Subscribes to /joy from the topside DS4 controller
-and publishes RC override commands to MAVROS for ArduSub control.
+This node directly controls the FC serial port and forwards all FC
+telemetry to a UDP port that MAVROS reads for ROS topic publishing.
 
-ArduSub RC Channel Mapping (Manual/Stabilize mode):
-  CH1: Pitch         (forward/back body tilt)
-  CH2: Roll          (left/right body tilt)
-  CH3: Throttle      (vertical — up/down)
-  CH4: Yaw           (rotate left/right)
-  CH5: Forward       (forward/reverse thrust)
-  CH6: Lateral       (strafe left/right)
-  CH7: reserved
-  CH8: Camera tilt / lights (configurable)
-
-DS4 Axis Mapping (joy_linux):
-  0: Left stick X  (left=1.0, right=-1.0)
-  1: Left stick Y  (up=1.0, down=-1.0)
-  2: L2 trigger    (released=1.0, pressed=-1.0)
-  3: Right stick X (left=1.0, right=-1.0)
-  4: Right stick Y (up=1.0, down=-1.0)
-  5: R2 trigger    (released=1.0, pressed=-1.0)
-  6: D-pad X       (left=1.0, right=-1.0)
-  7: D-pad Y       (up=1.0, down=-1.0)
-
-DS4 Button Mapping (joy_linux):
-  0: Cross (X)      4: L1        8: Share    12: PS
-  1: Circle (O)     5: R1        9: Options
-  2: Triangle       6: L2        10: L3
-  3: Square         7: R2        11: R3
+Architecture:
+  /dev/ttyACM0 ←→ this node ←→ UDP:14550 → MAVROS (read-only)
+                      ↑
+              /joy topic from topside
 """
 
+import threading
+import socket
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import Joy
-from mavros_msgs.msg import OverrideRCIn
-from mavros_msgs.srv import CommandBool, SetMode
-from std_srvs.srv import Trigger
+from mavros_msgs.msg import OverrideRCIn, State, VfrHud
+from std_srvs.srv import Trigger, SetBool
+from std_msgs.msg import Float64, Bool, String
+from pymavlink import mavutil
 
-
-# ArduSub PWM
-PWM_CENTER = 1500
-PWM_RANGE = 400   # ±400 → 1100-1900
-PWM_MIN = 1100
-PWM_MAX = 1900
+STICK_DEADZONE = 0.08
+NOISE_THRESHOLD = 0.03
 CHAN_NOCHANGE = 65535
 
 
-def axis_to_pwm(value, deadzone=0.05):
-    """Convert a -1.0..1.0 axis value to 1100-1900 PWM."""
-    if abs(value) < deadzone:
-        return PWM_CENTER
-    clamped = max(-1.0, min(1.0, value))
-    return int(max(PWM_MIN, min(PWM_MAX, PWM_CENTER + clamped * PWM_RANGE)))
+def apply_deadzone(value, deadzone=STICK_DEADZONE):
+    if abs(value) < deadzone: return 0.0
+    sign = 1.0 if value > 0 else -1.0
+    return sign * (abs(value) - deadzone) / (1.0 - deadzone)
 
 
-def trigger_to_thrust(value):
-    """Convert trigger axis (1.0=released, -1.0=pressed) to 0.0..1.0."""
-    return (1.0 - value) / 2.0
+class PIDController:
+    def __init__(self, kp=1.0, ki=0.1, kd=0.5, output_limit=1.0):
+        self.kp = kp; self.ki = ki; self.kd = kd
+        self.output_limit = output_limit
+        self.setpoint = 0.0; self.integral = 0.0
+        self.prev_error = 0.0; self.prev_time = None
+        self.integral_limit = output_limit / max(ki, 0.001)
+
+    def reset(self):
+        self.integral = 0.0; self.prev_error = 0.0; self.prev_time = None
+
+    def compute(self, current, t):
+        err = self.setpoint - current
+        if self.prev_time is None:
+            self.prev_time = t; self.prev_error = err; return 0.0
+        dt = t - self.prev_time
+        if dt <= 0: return 0.0
+        self.integral = max(-self.integral_limit,
+            min(self.integral_limit, self.integral + err * dt))
+        out = self.kp*err + self.ki*self.integral + self.kd*(err-self.prev_error)/dt
+        self.prev_error = err; self.prev_time = t
+        return max(-self.output_limit, min(self.output_limit, out))
 
 
 class JoyToMavlink(Node):
@@ -65,161 +61,236 @@ class JoyToMavlink(Node):
         super().__init__('joy_to_mavlink')
 
         self.declare_parameter('publish_rate_hz', 20.0)
-        self.declare_parameter('enable_override', True)
+        self.declare_parameter('serial_port', '/dev/ttyACM0')
+        self.declare_parameter('serial_baud', 115200)
+        self.declare_parameter('mavros_udp_port', 14550)
+        self.declare_parameter('depth_pid_kp', 1.0)
+        self.declare_parameter('depth_pid_ki', 0.1)
+        self.declare_parameter('depth_pid_kd', 0.5)
+
         rate = self.get_parameter('publish_rate_hz').value
-        self.enable_override = self.get_parameter('enable_override').value
+        serial_port = self.get_parameter('serial_port').value
+        serial_baud = self.get_parameter('serial_baud').value
+        mavros_port = self.get_parameter('mavros_udp_port').value
+        kp = self.get_parameter('depth_pid_kp').value
+        ki = self.get_parameter('depth_pid_ki').value
+        kd = self.get_parameter('depth_pid_kd').value
 
-        # Subscriber
-        self.joy_sub = self.create_subscription(Joy, '/joy', self.joy_callback, 10)
+        self.depth_pid = PIDController(kp=kp, ki=ki, kd=kd)
 
-        # RC Override publisher
-        self.rc_pub = self.create_publisher(
-            OverrideRCIn, '/mavros/mavros/override', 10
-        )
+        # Direct serial connection to FC
+        self.mav = None
+        self.mav_lock = threading.Lock()
+        try:
+            self.mav = mavutil.mavlink_connection(serial_port, baud=serial_baud)
+            self.mav.wait_heartbeat(timeout=10)
+            self.get_logger().info(
+                f'FC connected on {serial_port}: system {self.mav.target_system}')
+        except Exception as e:
+            self.get_logger().error(f'FC serial failed: {e}')
 
-        # Service clients for arm/disarm and mode set
-        self.arm_client = self.create_client(CommandBool, '/mavros/cmd/arming')
-        self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
+        # UDP socket to forward telemetry to MAVROS
+        self.mavros_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.mavros_addr = ('127.0.0.1', mavros_port)
 
-        # Photogrammetry capture client
+        # Start serial reader thread (reads FC, forwards to MAVROS UDP)
+        self.reader_thread = threading.Thread(target=self._serial_reader, daemon=True)
+        self.reader_thread.start()
+
+        # Start heartbeat thread
+        self.hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self.hb_thread.start()
+
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE, depth=10)
+
+        self.joy_sub = self.create_subscription(Joy, '/joy', self.joy_cb, 10)
+        self.state_sub = self.create_subscription(State, '/mavros/state', self.state_cb, 10)
+        self.vfr_sub = self.create_subscription(VfrHud, '/mavros/vfr_hud', self.vfr_cb, sensor_qos)
+
+        self.rc_pub = self.create_publisher(OverrideRCIn, '/mavros/mavros/override', 10)
+        self.depth_sp_pub = self.create_publisher(Float64, '/rov/depth_setpoint', 10)
+        self.depth_cur_pub = self.create_publisher(Float64, '/rov/depth_current', 10)
+        self.dh_pub = self.create_publisher(Bool, '/rov/depth_hold_active', 10)
+        self.pid_pub = self.create_publisher(String, '/rov/pid_status', 10)
+        self.heartbeat_pub = self.create_publisher(Bool, '/rov/fc_heartbeat', 10)
+
+        self.arm_client = self.create_client(SetBool, '/rov/arm')
         self.capture_client = self.create_client(Trigger, '/photogrammetry/capture')
 
-        # Publish timer
-        self.pub_timer = self.create_timer(1.0 / rate, self.publish_override)
+        self.pub_timer = self.create_timer(1.0 / rate, self.publish)
+        self.log_timer = self.create_timer(0.5, self.log)
+        self.status_timer = self.create_timer(0.25, self.pub_status)
+        self.hb_check_timer = self.create_timer(1.0, self.check_hb)
 
-        # Log timer (2 Hz for human readability)
-        self.log_timer = self.create_timer(0.5, self.log_state)
+        self.surge = 0.0; self.sway = 0.0; self.heave = 0.0; self.yaw = 0.0
+        self.prev_surge = 0.0; self.prev_sway = 0.0
+        self.prev_heave = 0.0; self.prev_yaw = 0.0
 
-        # State
-        self.armed = False
-        self.arm_button_prev = False
-        self.capture_button_prev = False
-        self.lights = PWM_CENTER  # 1100-1900
+        self.fc_armed = False; self.want_armed = False
+        self.arm_btn_prev = False; self.arm_pending = False
+        self.cap_btn_prev = False; self.fc_hb_ok = False
 
-        # Channel values
-        self.channels = [CHAN_NOCHANGE] * 18
-        # Initialize controlled channels to center
-        for i in range(6):
-            self.channels[i] = PWM_CENTER
+        self.depth_hold = False
+        self.dpad_left_prev = False; self.dpad_up_prev = False; self.dpad_down_prev = False
+        self.current_depth = 0.0; self.depth_valid = False; self.sp_step = 0.25
 
-        self.last_joy_time = self.get_clock().now()
-        self.joy_timeout_sec = 1.0  # safety: center if no joy for 1s
+        self.joy_received = False; self.last_joy = self.get_clock().now()
 
+        self.get_logger().info(f'Joy→MAVLink ready (direct serial, {rate}Hz)')
+
+    def _serial_reader(self):
+        """Background: read raw bytes from FC serial, forward to MAVROS UDP."""
+        while True:
+            try:
+                if self.mav and self.mav.port:
+                    data = self.mav.port.read(512)
+                    if data:
+                        self.mavros_sock.sendto(data, self.mavros_addr)
+            except Exception:
+                import time; time.sleep(0.1)
+
+    def _heartbeat_loop(self):
+        """Send GCS heartbeat to keep FC alive."""
+        import time
+        while True:
+            with self.mav_lock:
+                if self.mav:
+                    try:
+                        self.mav.mav.heartbeat_send(6, 8, 0, 0, 0)
+                    except: pass
+            time.sleep(1)
+
+    def check_hb(self):
+        msg = Bool(); msg.data = self.fc_hb_ok
+        self.heartbeat_pub.publish(msg); self.fc_hb_ok = False
+
+    def state_cb(self, msg):
+        self.fc_hb_ok = msg.connected
+        prev = self.fc_armed; self.fc_armed = msg.armed
+        if self.fc_armed != prev:
+            self.get_logger().info(f'FC {"ARMED" if self.fc_armed else "DISARMED"}')
+            self.want_armed = self.fc_armed
+            if not self.fc_armed: self.depth_hold = False; self.depth_pid.reset()
+
+    def vfr_cb(self, msg):
+        self.current_depth = -msg.altitude; self.depth_valid = True
+        m = Float64(); m.data = self.current_depth; self.depth_cur_pub.publish(m)
+
+    def _filter(self, new, prev):
+        if abs(new - prev) < NOISE_THRESHOLD and abs(new) < STICK_DEADZONE: return prev
+        return new
+
+    def joy_cb(self, msg):
+        if len(msg.axes) < 8 or len(msg.buttons) < 10: return
+        self.last_joy = self.get_clock().now()
+        if not self.joy_received:
+            self.joy_received = True; self.get_logger().info('Receiving joystick data')
+
+        self.surge = self._filter(apply_deadzone(msg.axes[1]), self.prev_surge); self.prev_surge = self.surge
+        self.sway = self._filter(apply_deadzone(msg.axes[0]), self.prev_sway); self.prev_sway = self.sway
+        self.yaw = self._filter(apply_deadzone(msg.axes[3]), self.prev_yaw); self.prev_yaw = self.yaw
+
+        dl = msg.axes[6] > 0.5
+        if dl and not self.dpad_left_prev: self._toggle_dh()
+        self.dpad_left_prev = dl
+        du = msg.axes[7] > 0.5; dd = msg.axes[7] < -0.5
+        if du and not self.dpad_up_prev and self.depth_hold: self.depth_pid.setpoint -= self.sp_step
+        if dd and not self.dpad_down_prev and self.depth_hold: self.depth_pid.setpoint += self.sp_step
+        self.dpad_up_prev = du; self.dpad_down_prev = dd
+
+        if self.depth_hold and self.depth_valid:
+            self.heave = self.depth_pid.compute(self.current_depth, self.get_clock().now().nanoseconds / 1e9)
+        else:
+            self.heave = self._filter(apply_deadzone(msg.axes[4]), self.prev_heave)
+        self.prev_heave = self.heave
+
+        opts = msg.buttons[9] == 1
+        if opts and not self.arm_btn_prev and not self.arm_pending:
+            self.want_armed = not self.want_armed; self.arm_pending = True; self._arm(self.want_armed)
+        self.arm_btn_prev = opts
+
+        tri = msg.buttons[2] == 1
+        if tri and not self.cap_btn_prev: self._capture()
+        self.cap_btn_prev = tri
+
+    def _toggle_dh(self):
+        self.depth_hold = not self.depth_hold
+        if self.depth_hold and self.depth_valid:
+            self.depth_pid.setpoint = self.current_depth; self.depth_pid.reset()
+            self.get_logger().info(f'Depth hold ON at {self.current_depth:.2f}m')
+        elif self.depth_hold: self.depth_hold = False
+        else: self.depth_pid.reset(); self.get_logger().info('Depth hold OFF')
+
+    def publish(self):
+        elapsed = (self.get_clock().now() - self.last_joy).nanoseconds / 1e9
+        if elapsed > 1.0:
+            self.surge = 0.0; self.sway = 0.0; self.yaw = 0.0
+            if not self.depth_hold: self.heave = 0.0
+
+        mc_x = int(self.surge * 1000)
+        mc_y = int(self.sway * 1000)
+        mc_z = int(500 + self.heave * 500)
+        mc_z = max(0, min(1000, mc_z))
+        mc_r = int(self.yaw * 1000)
+
+        # Send MANUAL_CONTROL directly to FC serial
+        with self.mav_lock:
+            if self.mav:
+                try:
+                    self.mav.mav.manual_control_send(
+                        self.mav.target_system, mc_x, mc_y, mc_z, mc_r, 0)
+                except Exception as e:
+                    self.get_logger().error(f'Send err: {e}')
+
+        # Publish for dashboard display
+        rc = OverrideRCIn()
+        pwm_x = int(1500 + mc_x * 0.4)
+        pwm_y = int(1500 + mc_y * 0.4)
+        pwm_z = int(1500 + (mc_z - 500) * 0.8)
+        pwm_r = int(1500 + mc_r * 0.4)
+        rc.channels = [pwm_x, pwm_y, pwm_z, pwm_r, CHAN_NOCHANGE, CHAN_NOCHANGE,
+                       CHAN_NOCHANGE, CHAN_NOCHANGE] + [CHAN_NOCHANGE] * 10
+        self.rc_pub.publish(rc)
+
+    def pub_status(self):
+        dh = Bool(); dh.data = self.depth_hold; self.dh_pub.publish(dh)
+        if self.depth_hold:
+            sp = Float64(); sp.data = self.depth_pid.setpoint; self.depth_sp_pub.publish(sp)
+        st = String()
+        st.data = (f'HOLD {self.depth_pid.setpoint:.2f}m | P={self.depth_pid.kp:.2f} '
+                  f'I={self.depth_pid.ki:.2f} D={self.depth_pid.kd:.2f}') if self.depth_hold else 'MANUAL'
+        self.pid_pub.publish(st)
+
+    def _arm(self, arm):
+        # Arm directly via serial
+        with self.mav_lock:
+            if self.mav:
+                try:
+                    if arm:
+                        self.mav.arducopter_arm()
+                        self.get_logger().info('Arming via serial...')
+                    else:
+                        self.mav.arducopter_disarm()
+                        self.get_logger().info('Disarming via serial...')
+                except Exception as e:
+                    self.get_logger().error(f'Arm err: {e}')
+        self.arm_pending = False
+
+    def log(self):
+        a = 'ARMED' if self.fc_armed else 'DISARMED'
+        hb = 'HB' if self.fc_hb_ok else 'NO-HB'
+        dh = f' DH={self.depth_pid.setpoint:.2f}m' if self.depth_hold else ''
+        d = f' d={self.current_depth:.2f}m' if self.depth_valid else ''
         self.get_logger().info(
-            f'Joy→MAVLink node ready (override={self.enable_override}, rate={rate}Hz)'
-        )
+            f'[{a} {hb}{dh}{d}] surge={self.surge:+.2f} sway={self.sway:+.2f} '
+            f'heave={self.heave:+.2f} yaw={self.yaw:+.2f}')
 
-    def joy_callback(self, msg):
-        if len(msg.axes) < 8 or len(msg.buttons) < 6:
-            return
-
-        self.last_joy_time = self.get_clock().now()
-
-        # Map DS4 to ArduSub channels
-        # CH5 (idx 4): Forward — left stick Y
-        self.channels[4] = axis_to_pwm(msg.axes[1])
-        # CH6 (idx 5): Lateral — right stick X
-        self.channels[5] = axis_to_pwm(msg.axes[3])
-        # CH4 (idx 3): Yaw — left stick X
-        self.channels[3] = axis_to_pwm(msg.axes[0])
-        # CH1 (idx 0): Pitch — right stick Y
-        self.channels[0] = axis_to_pwm(msg.axes[4])
-
-        # CH3 (idx 2): Throttle (vertical) — L2/R2 triggers
-        ascend = trigger_to_thrust(msg.axes[5])   # R2
-        descend = trigger_to_thrust(msg.axes[2])   # L2
-        vertical = ascend - descend
-        self.channels[2] = axis_to_pwm(vertical)
-
-        # CH2 (idx 1): Roll — not mapped, center
-        self.channels[1] = PWM_CENTER
-
-        # Arm/Disarm on Cross (button 0) — edge detect
-        cross_pressed = msg.buttons[0] == 1
-        if cross_pressed and not self.arm_button_prev:
-            self.toggle_arm()
-        self.arm_button_prev = cross_pressed
-
-        # Photogrammetry on Triangle (button 2) — edge detect
-        tri_pressed = msg.buttons[2] == 1
-        if tri_pressed and not self.capture_button_prev:
-            self.trigger_capture()
-        self.capture_button_prev = tri_pressed
-
-        # Lights on L1/R1 (buttons 4/5)
-        if msg.buttons[4] == 1:
-            self.lights = max(PWM_MIN, self.lights - 50)
-        if msg.buttons[5] == 1:
-            self.lights = min(PWM_MAX, self.lights + 50)
-        self.channels[7] = self.lights  # CH8 for lights
-
-    def publish_override(self):
-        # Safety: if no joy messages for > timeout, center everything
-        elapsed = (self.get_clock().now() - self.last_joy_time).nanoseconds / 1e9
-        if elapsed > self.joy_timeout_sec:
-            for i in range(6):
-                self.channels[i] = PWM_CENTER
-
-        if not self.enable_override:
-            return
-
-        msg = OverrideRCIn()
-        msg.channels = [int(c) for c in self.channels]
-        self.rc_pub.publish(msg)
-
-    def log_state(self):
-        ch = self.channels
-        self.get_logger().info(
-            f'[{"ARMED" if self.armed else "DISARMED"}] '
-            f'fwd={ch[4]} lat={ch[5]} vert={ch[2]} '
-            f'yaw={ch[3]} pitch={ch[0]} lights={ch[7]}'
-        )
-
-    def toggle_arm(self):
-        self.armed = not self.armed
-        if not self.arm_client.service_is_ready():
-            self.get_logger().warn('Arm service not available')
-            return
-
-        req = CommandBool.Request()
-        req.value = self.armed
-        future = self.arm_client.call_async(req)
-        future.add_done_callback(self._arm_done)
-        self.get_logger().info(f'{"Arming" if self.armed else "Disarming"}...')
-
-    def _arm_done(self, future):
-        try:
-            result = future.result()
-            if result.success:
-                self.get_logger().info(
-                    f'{"Armed" if self.armed else "Disarmed"} successfully'
-                )
-            else:
-                self.get_logger().warn(f'Arm command failed: {result.result}')
-                self.armed = not self.armed  # revert
-        except Exception as e:
-            self.get_logger().error(f'Arm service error: {e}')
-            self.armed = not self.armed
-
-    def trigger_capture(self):
-        if not self.capture_client.service_is_ready():
-            self.get_logger().warn('Photogrammetry capture service not available')
-            return
-
-        req = Trigger.Request()
-        future = self.capture_client.call_async(req)
-        future.add_done_callback(self._capture_done)
-        self.get_logger().info('Photogrammetry capture triggered')
-
-    def _capture_done(self, future):
-        try:
-            result = future.result()
-            if result.success:
-                self.get_logger().info(f'Capture: {result.message}')
-            else:
-                self.get_logger().warn(f'Capture failed: {result.message}')
-        except Exception as e:
-            self.get_logger().error(f'Capture service error: {e}')
+    def _capture(self):
+        if not self.capture_client.service_is_ready(): return
+        self.capture_client.call_async(Trigger.Request())
+        self.get_logger().info('Capture triggered')
 
 
 def main(args=None):

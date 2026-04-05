@@ -28,6 +28,8 @@ setup(
         'console_scripts': [
             'photogrammetry_node = rov_cameras.photogrammetry_node:main',
             'joy_to_mavlink = rov_cameras.joy_to_mavlink:main',
+            'arm_service = rov_cameras.arm_service:main',
+            'mavlink_bridge = rov_cameras.mavlink_bridge:main',
         ],
     },
 )
