@@ -192,10 +192,10 @@ class JoyToMavlink(Node):
         self.sway = self._filter(apply_deadzone(msg.axes[0]), self.prev_sway); self.prev_sway = self.sway
         self.yaw = self._filter(apply_deadzone(msg.axes[3]), self.prev_yaw); self.prev_yaw = self.yaw
 
-        dl = msg.axes[6] > 0.5
+        dl = msg.buttons[3] == 1  # Square button
         if dl and not self.dpad_left_prev: self._toggle_dh()
         self.dpad_left_prev = dl
-        du = msg.axes[7] > 0.5; dd = msg.axes[7] < -0.5
+        du = msg.buttons[4] == 1; dd = msg.buttons[5] == 1  # L1=up R1=down
         if du and not self.dpad_up_prev and self.depth_hold: self.depth_pid.setpoint -= self.sp_step
         if dd and not self.dpad_down_prev and self.depth_hold: self.depth_pid.setpoint += self.sp_step
         self.dpad_up_prev = du; self.dpad_down_prev = dd
