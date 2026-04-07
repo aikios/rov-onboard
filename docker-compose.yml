@@ -7,17 +7,22 @@ services:
       - /dev:/dev
     command: ros2 run rov_cameras joy_to_mavlink
     restart: unless-stopped
+    # Owns FC serial port, forwards telemetry to MAVROS via UDP:14550
+    # Must start before MAVROS
 
   mavros:
     build: .
     network_mode: host
     command: ros2 launch rov_cameras mavros.launch.py
     depends_on:
-      - joy_to_mavlink
+      joy_to_mavlink:
+        condition: service_started
     restart: unless-stopped
+    # Reads FC telemetry from UDP:14550, publishes ROS topics
 
   photogrammetry:
     build: .
     network_mode: host
     command: ros2 run rov_cameras photogrammetry_node
     restart: unless-stopped
+    # Polls Pi Zero camera for preview, handles full-res captures
