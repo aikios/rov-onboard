@@ -2,11 +2,11 @@ import os
 from glob import glob
 from setuptools import find_packages, setup
 
-package_name = 'rov_cameras'
+package_name = 'rov_flight'
 
 setup(
     name=package_name,
-    version='0.3.0',
+    version='0.1.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -19,15 +19,12 @@ setup(
     zip_safe=True,
     maintainer='hydromeda',
     maintainer_email='hydromeda@todo.todo',
-    description='ROV onboard — FC control, camera preview, MAVROS bridge',
+    description='ROV flight control: joystick to MAVLink, MAVROS bridge, depth hold PID',
     license='MIT',
-    extras_require={
-        'test': ['pytest'],
-    },
+    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'joy_to_mavlink = rov_cameras.joy_to_mavlink:main',
-            'photogrammetry_node = rov_cameras.photogrammetry_node:main',
+            'joy_to_mavlink = rov_flight.joy_to_mavlink:main',
         ],
     },
 )

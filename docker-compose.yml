@@ -5,7 +5,7 @@ services:
     privileged: true  # for /dev/ttyACM0 serial access
     volumes:
       - /dev:/dev
-    command: ros2 run rov_cameras joy_to_mavlink
+    command: ros2 run rov_flight joy_to_mavlink
     restart: unless-stopped
     # Owns FC serial port, forwards telemetry to MAVROS via UDP:14550
     # Must start before MAVROS
@@ -13,7 +13,7 @@ services:
   mavros:
     build: .
     network_mode: host
-    command: ros2 launch rov_cameras mavros.launch.py
+    command: ros2 launch rov_flight mavros.launch.py
     depends_on:
       joy_to_mavlink:
         condition: service_started
@@ -23,6 +23,6 @@ services:
   photogrammetry:
     build: .
     network_mode: host
-    command: ros2 run rov_cameras photogrammetry_node
+    command: ros2 run rov_photogrammetry node
     restart: unless-stopped
     # Polls Pi Zero camera for preview, handles full-res captures

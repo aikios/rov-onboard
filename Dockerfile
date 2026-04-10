@@ -26,9 +26,9 @@ RUN pip3 install --break-system-packages pymavlink
 WORKDIR /ros_ws
 COPY src/ src/
 
-# Build
+# Build all onboard packages (rov_flight, rov_photogrammetry)
 RUN . /opt/ros/jazzy/setup.sh && \
-    colcon build --packages-select rov_cameras --symlink-install
+    colcon build --symlink-install
 
 # DDS config
 COPY cyclonedds_onboard.xml /ros_ws/cyclonedds.xml

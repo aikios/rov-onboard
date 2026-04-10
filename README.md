@@ -30,13 +30,13 @@ nano cyclonedds_onboard.xml
 ./stop.sh
 ```
 
-## What It Does
+## ROS2 Packages
 
-| Container | Purpose |
-|-----------|---------|
-| `joy_to_mavlink` | Owns FC serial, sends MANUAL_CONTROL, forwards telemetry via UDP:14550, handles arming + depth hold PID |
-| `mavros` | Reads FC telemetry from UDP:14550, publishes ROS topics for topside consumption |
-| `photogrammetry` | Polls Pi Zero camera for 640x480 preview at 2Hz, handles full-res capture requests |
+| Package | Container | Purpose |
+|---------|-----------|---------|
+| `rov_flight` | `joy_to_mavlink` | Owns FC serial, sends MANUAL_CONTROL, forwards telemetry via UDP:14550, arming + depth hold PID |
+| `rov_flight` | `mavros` | Reads FC telemetry from UDP:14550, publishes ROS topics |
+| `rov_photogrammetry` | `photogrammetry` | Polls Pi Zero camera for 640x480 preview at 2Hz, full-res captures |
 
 ## Architecture
 
@@ -94,13 +94,13 @@ sudo pip3 install --break-system-packages pymavlink
 
 cd ~/rov_ws
 source /opt/ros/jazzy/setup.bash
-colcon build --packages-select rov_cameras --symlink-install
+colcon build --symlink-install
 source install/setup.bash
 
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 export CYCLONEDDS_URI=file://$HOME/cyclonedds.xml
 
-ros2 run rov_cameras joy_to_mavlink &    # start FIRST (owns serial)
-ros2 launch rov_cameras mavros.launch.py &
-ros2 run rov_cameras photogrammetry_node &
+ros2 run rov_flight joy_to_mavlink &      # start FIRST (owns serial)
+ros2 launch rov_flight mavros.launch.py &
+ros2 run rov_photogrammetry node &
 ```
