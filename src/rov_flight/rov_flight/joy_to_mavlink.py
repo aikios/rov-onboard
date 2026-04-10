@@ -43,6 +43,10 @@ class PIDController:
     def reset(self):
         self.integral = 0.0; self.prev_error = 0.0; self.prev_time = None
 
+    def set_gains(self, kp, ki, kd):
+        self.kp = kp; self.ki = ki; self.kd = kd
+        self.integral_limit = self.output_limit / max(ki, 0.001)
+
     def compute(self, current, t):
         err = self.setpoint - current
         if self.prev_time is None:
@@ -54,6 +58,152 @@ class PIDController:
         out = self.kp*err + self.ki*self.integral + self.kd*(err-self.prev_error)/dt
         self.prev_error = err; self.prev_time = t
         return max(-self.output_limit, min(self.output_limit, out))
+
+
+class RelayAutoTuner:
+    """
+    Astrom-Hagglund relay auto-tuner.
+
+    Replaces the controller with a relay (bang-bang) that switches output
+    between +d and -d based on the sign of error. The system then
+    oscillates at its critical frequency with period Tu and amplitude a.
+    From these the ultimate gain Ku is computed:
+        Ku = 4 * d / (pi * a)
+    Then Ziegler-Nichols rules give PID gains:
+        Kp = 0.6 * Ku
+        Ki = 1.2 * Ku / Tu  (i.e. Ti = Tu / 2)
+        Kd = 0.075 * Ku * Tu (i.e. Td = Tu / 8)
+    """
+
+    def __init__(self, relay_amplitude=0.4, hysteresis=0.05,
+                 min_cycles=4, timeout=60.0):
+        self.d = relay_amplitude
+        self.h = hysteresis  # error band to suppress noise-driven flips
+        self.min_cycles = min_cycles
+        self.timeout = timeout
+
+        self.active = False
+        self.setpoint = 0.0
+        self.relay_state = +1  # +1 or -1
+        self.start_time = None
+
+        # Track switches and peaks for period + amplitude calculation
+        self.switch_times = []  # times of relay sign flips
+        self.peak_high = -1e9
+        self.peak_low = +1e9
+        self.peak_history = []  # list of (time, peak_high, peak_low) per cycle
+
+    def start(self, setpoint, t):
+        self.active = True
+        self.setpoint = setpoint
+        self.relay_state = +1
+        self.start_time = t
+        self.switch_times = []
+        self.peak_high = -1e9
+        self.peak_low = +1e9
+        self.peak_history = []
+
+    def stop(self):
+        self.active = False
+
+    def step(self, current, t):
+        """
+        Returns (relay_output, done, gains_dict_or_None).
+        relay_output is in [-d, +d]; gains_dict has kp, ki, kd, ku, tu when done.
+        """
+        if not self.active:
+            return 0.0, False, None
+
+        if t - self.start_time > self.timeout:
+            self.active = False
+            return 0.0, True, None  # timeout, no gains
+
+        error = self.setpoint - current
+
+        # Track local extremes within the current half-cycle
+        if self.relay_state > 0:
+            # output is +d, system should drive UP, peak_high tracks max
+            if current > self.peak_high:
+                self.peak_high = current
+        else:
+            if current < self.peak_low:
+                self.peak_low = current
+
+        # Hysteresis-aware relay switching
+        switched = False
+        if self.relay_state > 0 and error < -self.h:
+            # process overshot, flip to -d
+            self.relay_state = -1
+            switched = True
+        elif self.relay_state < 0 and error > self.h:
+            self.relay_state = +1
+            switched = True
+
+        if switched:
+            self.switch_times.append(t)
+            # Record peak from the half-cycle that just ended
+            if len(self.switch_times) >= 2:
+                self.peak_history.append((t, self.peak_high, self.peak_low))
+            # Reset peak trackers for the new half-cycle
+            self.peak_high = current
+            self.peak_low = current
+
+        # Need at least min_cycles full oscillations to compute gains
+        # Each full cycle = 2 switches, so we need 2*min_cycles + 1 switches
+        if len(self.switch_times) >= 2 * self.min_cycles + 1:
+            return self._finish()
+
+        return self.relay_state * self.d, False, None
+
+    def _finish(self):
+        """Compute Ku, Tu, and PID gains from oscillation data."""
+        import math
+
+        # Average period from the last few full cycles
+        # A full period spans 2 switches (one + cycle, one - cycle)
+        switches = self.switch_times
+        # Period = time between every-other switch
+        periods = []
+        for i in range(2, len(switches)):
+            periods.append(switches[i] - switches[i - 2])
+        if not periods:
+            self.active = False
+            return 0.0, True, None
+        tu = sum(periods[-min(4, len(periods)):]) / min(4, len(periods))
+
+        # Amplitude = average peak-to-peak / 2 from the last few cycles
+        recent = self.peak_history[-min(4, len(self.peak_history)):]
+        if not recent:
+            self.active = False
+            return 0.0, True, None
+        amps = [(p[1] - p[2]) / 2.0 for p in recent if p[1] > p[2]]
+        if not amps:
+            self.active = False
+            return 0.0, True, None
+        a = sum(amps) / len(amps)
+        if a < 1e-6:
+            self.active = False
+            return 0.0, True, None
+
+        # Astrom-Hagglund critical gain
+        ku = (4.0 * self.d) / (math.pi * a)
+
+        # Ziegler-Nichols classic PID rule
+        kp = 0.6 * ku
+        ti = tu / 2.0
+        td = tu / 8.0
+        ki = kp / ti if ti > 1e-6 else 0.0
+        kd = kp * td
+
+        # Sanity clamp — anything beyond these is probably nonsense
+        kp = max(0.05, min(5.0, kp))
+        ki = max(0.005, min(2.0, ki))
+        kd = max(0.005, min(3.0, kd))
+
+        self.active = False
+        return 0.0, True, {
+            'kp': kp, 'ki': ki, 'kd': kd, 'ku': ku, 'tu': tu, 'a': a
+        }
 
 
 class JoyToMavlink(Node):
@@ -77,6 +227,8 @@ class JoyToMavlink(Node):
         kd = self.get_parameter('depth_pid_kd').value
 
         self.depth_pid = PIDController(kp=kp, ki=ki, kd=kd)
+        self.autotuner = RelayAutoTuner(relay_amplitude=0.4, hysteresis=0.05,
+                                        min_cycles=4, timeout=60.0)
 
         # Direct serial connection to FC
         self.mav = None
@@ -108,6 +260,8 @@ class JoyToMavlink(Node):
         self.joy_sub = self.create_subscription(Joy, '/joy', self.joy_cb, 10)
         self.state_sub = self.create_subscription(State, '/mavros/state', self.state_cb, 10)
         self.vfr_sub = self.create_subscription(VfrHud, '/mavros/vfr_hud', self.vfr_cb, sensor_qos)
+        self.autotune_sub = self.create_subscription(
+            Bool, '/rov/autotune_trigger', self.autotune_cb, 10)
 
         self.rc_pub = self.create_publisher(OverrideRCIn, '/mavros/mavros/override', 10)
         self.depth_sp_pub = self.create_publisher(Float64, '/rov/depth_setpoint', 10)
@@ -172,11 +326,39 @@ class JoyToMavlink(Node):
         if self.fc_armed != prev:
             self.get_logger().info(f'FC {"ARMED" if self.fc_armed else "DISARMED"}')
             self.want_armed = self.fc_armed
-            if not self.fc_armed: self.depth_hold = False; self.depth_pid.reset()
+            if not self.fc_armed:
+                self.depth_hold = False
+                self.depth_pid.reset()
+                if self.autotuner.active:
+                    self.autotuner.stop()
 
     def vfr_cb(self, msg):
         self.current_depth = -msg.altitude; self.depth_valid = True
         m = Float64(); m.data = self.current_depth; self.depth_cur_pub.publish(m)
+
+    def autotune_cb(self, msg):
+        """Trigger auto-tune when dashboard sends True on /rov/autotune_trigger."""
+        if not msg.data:
+            return
+        if not self.fc_armed:
+            self.get_logger().warn('Auto-tune ignored: FC not armed')
+            return
+        if not self.depth_valid:
+            self.get_logger().warn('Auto-tune ignored: no depth reading')
+            return
+        if self.autotuner.active:
+            self.get_logger().warn('Auto-tune already running')
+            return
+        # Force depth hold ON, capture current depth as setpoint
+        self.depth_hold = True
+        self.depth_pid.setpoint = self.current_depth
+        self.depth_pid.reset()
+        now = self.get_clock().now().nanoseconds / 1e9
+        self.autotuner.start(self.current_depth, now)
+        self.get_logger().info(
+            f'Auto-tune STARTED at depth {self.current_depth:.2f}m '
+            f'(relay=±{self.autotuner.d}, hyst={self.autotuner.h}, '
+            f'min_cycles={self.autotuner.min_cycles})')
 
     def _filter(self, new, prev):
         if abs(new - prev) < NOISE_THRESHOLD and abs(new) < STICK_DEADZONE: return prev
@@ -200,8 +382,23 @@ class JoyToMavlink(Node):
         if dd and not self.dpad_down_prev and self.depth_hold: self.depth_pid.setpoint += self.sp_step
         self.dpad_up_prev = du; self.dpad_down_prev = dd
 
-        if self.depth_hold and self.depth_valid:
-            self.heave = self.depth_pid.compute(self.current_depth, self.get_clock().now().nanoseconds / 1e9)
+        now = self.get_clock().now().nanoseconds / 1e9
+        if self.autotuner.active and self.depth_valid:
+            # Auto-tuner overrides PID with relay
+            relay_out, done, gains = self.autotuner.step(self.current_depth, now)
+            self.heave = relay_out
+            if done:
+                if gains:
+                    self.depth_pid.set_gains(gains['kp'], gains['ki'], gains['kd'])
+                    self.depth_pid.reset()
+                    self.get_logger().info(
+                        f'Auto-tune DONE: Ku={gains["ku"]:.3f} Tu={gains["tu"]:.2f}s '
+                        f'a={gains["a"]:.3f}m -> kp={gains["kp"]:.3f} '
+                        f'ki={gains["ki"]:.3f} kd={gains["kd"]:.3f}')
+                else:
+                    self.get_logger().warn('Auto-tune timed out or failed')
+        elif self.depth_hold and self.depth_valid:
+            self.heave = self.depth_pid.compute(self.current_depth, now)
         else:
             self.heave = self._filter(apply_deadzone(msg.axes[4]), self.prev_heave)
         self.prev_heave = self.heave
@@ -221,7 +418,12 @@ class JoyToMavlink(Node):
             self.depth_pid.setpoint = self.current_depth; self.depth_pid.reset()
             self.get_logger().info(f'Depth hold ON at {self.current_depth:.2f}m')
         elif self.depth_hold: self.depth_hold = False
-        else: self.depth_pid.reset(); self.get_logger().info('Depth hold OFF')
+        else:
+            self.depth_pid.reset()
+            if self.autotuner.active:
+                self.autotuner.stop()
+                self.get_logger().info('Auto-tune cancelled by depth hold toggle')
+            self.get_logger().info('Depth hold OFF')
 
     def publish(self):
         elapsed = (self.get_clock().now() - self.last_joy).nanoseconds / 1e9
@@ -259,8 +461,16 @@ class JoyToMavlink(Node):
         if self.depth_hold:
             sp = Float64(); sp.data = self.depth_pid.setpoint; self.depth_sp_pub.publish(sp)
         st = String()
-        st.data = (f'HOLD {self.depth_pid.setpoint:.2f}m | P={self.depth_pid.kp:.2f} '
-                  f'I={self.depth_pid.ki:.2f} D={self.depth_pid.kd:.2f}') if self.depth_hold else 'MANUAL'
+        if self.autotuner.active:
+            cycles = max(0, (len(self.autotuner.switch_times) - 1) // 2)
+            st.data = (f'TUNING ({cycles}/{self.autotuner.min_cycles} cycles) '
+                      f'sp={self.autotuner.setpoint:.2f}m')
+        elif self.depth_hold:
+            st.data = (f'HOLD {self.depth_pid.setpoint:.2f}m | P={self.depth_pid.kp:.2f} '
+                      f'I={self.depth_pid.ki:.2f} D={self.depth_pid.kd:.2f}')
+        else:
+            st.data = (f'MANUAL | P={self.depth_pid.kp:.2f} '
+                      f'I={self.depth_pid.ki:.2f} D={self.depth_pid.kd:.2f}')
         self.pid_pub.publish(st)
 
     def _arm(self, arm):
